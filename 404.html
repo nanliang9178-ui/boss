@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#FF5A1F" />
+    <title>天枢点单 · 商户工作台</title>
+    <noscript><meta http-equiv="refresh" content="0; url=/boss/" /></noscript>
+  </head>
+  <body>
+    <div id="root">
+      <div style="font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif; color: #6f625a; padding: 48px 24px; text-align: center;">
+        正在加载「天枢点单 · 商户工作台」…
+      </div>
+    </div>
+    <script>
+      /*
+       * GitHub Pages 的 404 兜底：单页应用的深层链接（如 /boss/demo）由本页
+       * 动态加载对应外壳脚本，路径必须写绝对路径，因为 404 页可能出现在任意深度。
+       */
+      (function () {
+        var p = location.pathname.replace(/\/+$/, '') || '/';
+        if (p !== '/boss' && p.indexOf('/boss/') !== 0) {
+          location.replace('/boss/');
+          return;
+        }
+
+        var cfg = {
+          title: '天枢点单 · 商户工作台',
+          icon: '/boss/favicon.svg',
+          css: '/boss/assets/admin-app.css',
+          mocks: [
+                '/boss/assets/mqtt.min.js',
+                '/boss/assets/live-sync.js',
+                '/boss/assets/mock-core.js',
+                '/boss/assets/mock-admin.js'
+          ],
+          app: '/boss/assets/admin-app.js',
+        };
+
+        document.title = cfg.title;
+
+        var icon = document.createElement('link');
+        icon.rel = 'icon';
+        icon.type = 'image/svg+xml';
+        icon.href = cfg.icon;
+        document.head.appendChild(icon);
+
+        var css = document.createElement('link');
+        css.rel = 'stylesheet';
+        css.crossOrigin = 'anonymous';
+        css.href = cfg.css;
+        document.head.appendChild(css);
+
+        var index = 0;
+
+        function loadScript(src, done) {
+          var script = document.createElement('script');
+          script.src = src;
+          script.async = false;
+          script.onload = done;
+          script.onerror = function () {
+            console.error('[tianshu-demo] 脚本加载失败：' + src);
+            done();
+          };
+          document.body.appendChild(script);
+        }
+
+        function loadApp() {
+          var script = document.createElement('script');
+          script.type = 'module';
+          script.crossOrigin = 'anonymous';
+          script.src = cfg.app;
+          document.body.appendChild(script);
+        }
+
+        function next() {
+          if (index < cfg.mocks.length) {
+            loadScript(cfg.mocks[index++], next);
+            return;
+          }
+          loadApp();
+        }
+
+        next();
+      })();
+    </script>
+  </body>
+</html>
