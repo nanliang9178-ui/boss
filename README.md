@@ -10,6 +10,10 @@
 | 手机老板台 | https://nanliang9178-ui.github.io/boss/boss |
 | 平台运营后台 | https://nanliang9178-ui.github.io/boss/platform |
 
+> 线上页面就是安装包里的**原版商户后台**（`source/apps/admin` 的构建产物），界面、文案、模块与源码完全一致；
+> 商户端不再有「品牌白标」「员工与权限」这两个模块，经营概览的快捷操作也不再有「品牌换装」入口。
+> 静态部署没有后端，`assets/mock-*.js` 负责模拟 `/api`，数据存在浏览器内，功能可正常点击。
+
 ## 演示账号
 
 | 角色 | 账号 | 密码 | 说明 |
