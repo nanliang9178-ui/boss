@@ -1,0 +1,25 @@
+{
+  "name": "tianshu-boss",
+  "version": "1.0.0",
+  "private": true,
+  "description": "天枢点单 · 老板端（商户后台 + 手机老板台 + 服务端）",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "build:shared": "npm run build -w @tianshu/shared",
+    "prisma:generate": "npm run prisma:generate -w @tianshu/api",
+    "prisma:push": "npm run prisma:push -w @tianshu/api",
+    "seed": "npm run seed -w @tianshu/api",
+    "setup": "npm install && npm run build:shared && npm run prisma:push && npm run seed",
+    "seed:longjiang": "npm run seed:longjiang -w @tianshu/api",
+    "dev:api": "npm run build:shared && npm run start:dev -w @tianshu/api",
+    "dev:admin": "npm run build:shared && npm run dev -w @tianshu/admin",
+    "build": "npm run build:shared && npm run build -w @tianshu/api && npm run build -w @tianshu/admin",
+    "start": "npm run start:prod -w @tianshu/api"
+  }
+}

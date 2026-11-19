@@ -29,3 +29,27 @@
 ![顾客扫码点餐入口](https://nanliang9178-ui.github.io/Consume/assets/qr/entry-customer.png)
 
 > 说明：微信小程序码需要注册并认证小程序后生成（后续工作）；当前交付的是普通二维码 + 网页网址。
+
+## 真实源码（`source/`）
+
+根目录这套 `index.html` + `assets/` 是**静态演示站**，GitHub Pages 直接托管它。
+安装包里的**原始工程源码**放在 `source/`，与演示站互不影响：
+
+| 路径 | 内容 |
+| --- | --- |
+| `source/apps/admin` | 商户后台（React 19 + Vite + Tailwind） |
+| `source/apps/api` | 服务端（NestJS 11 + Prisma + SQLite） |
+| `source/packages/shared` | 共享类型 / 订单状态机 / 金额工具 |
+| `source/deploy` | nginx + PM2 配置 |
+
+```bash
+cd source
+npm install
+npm run setup      # 建库 + 灌演示数据（SQLite，无需装数据库）
+npm run dev:api    # 终端 A：http://localhost:3000
+npm run dev:admin  # 终端 B：http://localhost:5173
+```
+
+- 演示账号：`demo` / `demo888`（商户老板）、`staff` / `staff888`（店员）、`admin` / `admin888`（平台运营）。
+- 构建时自动加 `/boss/` 前缀，本地开发走根路径。
+- 后端的 `.env`、`data/`（SQLite 库）、`uploads/` 已在 `.gitignore` 中排除，不要强推。

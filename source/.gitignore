@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+*.tsbuildinfo
+.DS_Store
+.env
+.env.local
+Thumbs.db
+
+# 运行期数据与上传文件
+apps/api/data/
+apps/api/uploads/
