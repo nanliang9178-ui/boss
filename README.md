@@ -1,59 +1,37 @@
-# 天枢点单 · 老板端 / 商户后台（boss）
+# boss · 天枢点单老板端（商户后台）
 
-> 天枢点单（多商户扫码点单 SaaS 白标系统）的**老板端入口**静态演示：登录 → 数据看板 → 订单接单/出餐 → 菜品/桌位管理 → 营业额统计 → 平台商户管理。
+安装包《天枢架构(4)》`apps/admin` 构建产物，UI、路由、文案与源码一致，仅把部署基路径从 `/` 调整为 `/boss/`。
 
 ## 入口网址
 
-| 用途 | 网址 |
-| --- | --- |
-| **商户后台入口（老板端）** | https://nanliang9178-ui.github.io/boss/ |
-| 手机老板台 | https://nanliang9178-ui.github.io/boss/boss |
-| 平台运营后台 | https://nanliang9178-ui.github.io/boss/platform |
-
-> 线上页面就是安装包里的**原版商户后台**（`source/apps/admin` 的构建产物），界面、文案、模块与源码完全一致；
-> 商户端不再有「品牌白标」「员工与权限」这两个模块，经营概览的快捷操作也不再有「品牌换装」入口。
-> 静态部署没有后端，`assets/mock-*.js` 负责模拟 `/api`，数据存在浏览器内，功能可正常点击。
+- 老板端后台入口：<https://nanliang9178-ui.github.io/boss/>
+- 登录后自动进入「经营概览」；手机端可直接访问「老板台」（`/boss/boss`）。
 
 ## 演示账号
 
 | 角色 | 账号 | 密码 | 说明 |
-| --- | --- | --- | --- |
-| 老板 | `demo` | `demo888` | 主商户「椒香里·川味小馆」，商户编码可留空 |
-| 员工 | `staff` | `staff888` | 接单 / 出餐 |
-| 店长 | `manager` | `manager888` | 管理角色 |
-| 平台运营 | `admin` | `admin888` | 从 `/boss/platform` 登录，可看多商户 |
+|---|---|---|---|
+| 商户老板 | `demo` | `demo888` | 商户编码 `demo`（登录页已预填，可一键填入） |
+| 店员 | `staff` | `staff888` | 商户编码 `demo` |
+| 平台运营 | `admin` | `admin888` | 登录页切换到「平台运营」标签 |
 
-## 和顾客端的关系
+## 数据说明
 
-- 顾客扫码点餐端：https://nanliang9178-ui.github.io/Consume/
-  （演示桌台 A01 直达地址：https://nanliang9178-ui.github.io/Consume/demo）
-- 「桌位管理」里每张桌的桌码图片来自 `Consume` 仓库的 `assets/qr/`，二维码内容为 `https://nanliang9178-ui.github.io/Consume/<scene>`，可直接下载打印。
-- 顾客下单后，本后台通过 `assets/live-sync.js`（公开 MQTT）**实时**收到新订单提示与列表刷新；没有真实后端，`assets/mock-*.js` 模拟 `/api/*` 接口。
+- 页面由安装包 `apps/admin` 源码构建，接口行为由 `assets/t4-shim.js` 在浏览器内模拟，种子数据来自安装包自带 `apps/api/data/app.db` 的真实导出（`assets/t4-seed.js`）。
+- 含经营概览、老板台、订单工作台、菜品管理、桌码管理、经营统计、品牌白标、店铺设置、小程序配置、微信支付、平台运营等完整页面。
+- 桌码管理里的「桌码地址」指向同站顾客端 `https://nanliang9178-ui.github.io/Consume/t/<sceneCode>`，扫码即进入对应桌位点单页。
+- 订单数据保存在浏览器 localStorage；同一浏览器的多个标签页实时同步，跨设备/跨浏览器通过公开 MQTT 通道同步（安装包 Socket.IO 实时推送的演示版）。
+- 真实微信支付需要配置商户号与证书，本演示使用安装包的 `ALLOW_MOCK_PAY` 模拟支付。
 
-![顾客扫码点餐入口](https://nanliang9178-ui.github.io/Consume/assets/qr/entry-customer.png)
+## 目录
 
-> 说明：微信小程序码需要注册并认证小程序后生成（后续工作）；当前交付的是普通二维码 + 网页网址。
-
-## 真实源码（`source/`）
-
-根目录这套 `index.html` + `assets/` 是**静态演示站**，GitHub Pages 直接托管它。
-安装包里的**原始工程源码**放在 `source/`，与演示站互不影响：
-
-| 路径 | 内容 |
-| --- | --- |
-| `source/apps/admin` | 商户后台（React 19 + Vite + Tailwind） |
-| `source/apps/api` | 服务端（NestJS 11 + Prisma + SQLite） |
-| `source/packages/shared` | 共享类型 / 订单状态机 / 金额工具 |
-| `source/deploy` | nginx + PM2 配置 |
-
-```bash
-cd source
-npm install
-npm run setup      # 建库 + 灌演示数据（SQLite，无需装数据库）
-npm run dev:api    # 终端 A：http://localhost:3000
-npm run dev:admin  # 终端 B：http://localhost:5173
+```
+index.html          入口（404.html 与之相同，用于 GitHub Pages 深链路 SPA 兜底）
+assets/             构建产物 + t4-seed.js（种子数据）+ t4-shim.js（演示数据层）
 ```
 
-- 演示账号：`demo` / `demo888`（商户老板）、`staff` / `staff888`（店员）、`admin` / `admin888`（平台运营）。
-- 构建时自动加 `/boss/` 前缀，本地开发走根路径。
-- 后端的 `.env`、`data/`（SQLite 库）、`uploads/` 已在 `.gitignore` 中排除，不要强推。
+
+## 关于 source/
+
+source/ 目录为安装包《天枢架构(4)》的原始前端源码（apps/h5、apps/admin 等），仅用于对照核对；线上入口只使用根目录的构建产物（index.html + assets/）。
+
