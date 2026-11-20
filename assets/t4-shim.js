@@ -296,7 +296,7 @@
       enabled: !!c.enabled,
       verifiedAt: c.verifiedAt || null,
       statusMsg: c.statusMsg || null,
-      notifyUrl: c.notifyUrl || '',
+      notifyUrl: (typeof location !== 'undefined' && location.origin ? location.origin : '') + '/api/pay/notify/' + (db.tenant && db.tenant.code || 'demo'),
       mockAllowed: true,
       ready: !!(c.enabled && c.mchId && c.hasPrivateKey && c.apiV3KeyMasked)
     };
