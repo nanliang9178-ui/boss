@@ -31,7 +31,6 @@ assets/             构建产物 + t4-seed.js（种子数据）+ t4-shim.js（�
 ```
 
 
-## 关于 source/
+---
 
-source/ 目录为安装包《天枢架构(4)》的原始前端源码（apps/h5、apps/admin 等），仅用于对照核对；线上入口只使用根目录的构建产物（index.html + assets/）。
-
+source/ 目录为安装包(4)原始工程源码，仅作对照参考，不参与部署。

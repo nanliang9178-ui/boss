@@ -220,6 +220,187 @@
 
   function publicBaseUrl() { return CONSUME_BASE; }
 
+  function maskSecret(value, keep) {
+    keep = keep || 4;
+    if (!value) return '';
+    if (value.length <= keep * 2) return new Array(value.length + 1).join('*');
+    return value.slice(0, keep) + new Array(Math.min(12, value.length - keep * 2) + 1).join('*') + value.slice(-keep);
+  }
+
+  function parseBanners(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    try { var arr = JSON.parse(value); return Array.isArray(arr) ? arr : []; } catch (e) { return []; }
+  }
+
+  function normalizeSpecGroups(groups) {
+    var out = [];
+    (Array.isArray(groups) ? groups : []).forEach(function (g, gi) {
+      var groupName = g.name || ('规格' + (gi + 1));
+      var opts = (Array.isArray(g.options) ? g.options : []).map(function (o, oi) {
+        return {
+          id: o.id || uid('so'),
+          name: o.name || ('选项' + (oi + 1)),
+          priceDelta: Number(o.priceDelta) || 0,
+          defaultSelected: !!o.defaultSelected,
+          sort: typeof o.sort === 'number' ? o.sort : oi
+        };
+      });
+      if (!opts.length) throw httpError(400, '规格「' + groupName + '」至少需要一个选项');
+      if (!g.multiple && opts.filter(function (o) { return o.defaultSelected; }).length > 1) {
+        throw httpError(400, '规格「' + groupName + '」为单选，不能设置多个默认项');
+      }
+      out.push({
+        id: g.id || uid('sg'),
+        name: groupName,
+        required: !!g.required,
+        multiple: !!g.multiple,
+        sort: typeof g.sort === 'number' ? g.sort : gi,
+        options: opts
+      });
+    });
+    return out;
+  }
+
+  function freshSpecGroups(groups) {
+    return (Array.isArray(groups) ? groups : []).map(function (g) {
+      var gg = clone(g);
+      delete gg.id;
+      gg.options = (g.options || []).map(function (o) { var oo = clone(o); delete oo.id; return oo; });
+      return gg;
+    });
+  }
+
+  function serializeProduct(db, product) {
+    var out = clone(product);
+    var cat = db.categories.find(function (c) { return c.id === product.categoryId; });
+    out.category = cat ? { id: cat.id, name: cat.name } : (product.category || null);
+    out.specGroups = (product.specGroups || []).slice().sort(function (a, b) { return (a.sort || 0) - (b.sort || 0); }).map(function (g) {
+      var gg = clone(g);
+      gg.options = (g.options || []).slice().sort(function (a, b) { return (a.sort || 0) - (b.sort || 0); });
+      return gg;
+    });
+    return out;
+  }
+
+  function payConfigView(db) {
+    var c = db.pay.config;
+    return {
+      appId: c.appId || '',
+      appSecretMasked: c.appSecretMasked || '',
+      mchId: c.mchId || '',
+      serialNo: c.serialNo || '',
+      apiV3KeyMasked: c.apiV3KeyMasked || '',
+      privateKeyMasked: c.hasPrivateKey ? '已上传，如需更换请重新上传' : '',
+      hasPrivateKey: !!c.hasPrivateKey,
+      enabled: !!c.enabled,
+      verifiedAt: c.verifiedAt || null,
+      statusMsg: c.statusMsg || null,
+      notifyUrl: c.notifyUrl || '',
+      mockAllowed: true,
+      ready: !!(c.enabled && c.mchId && c.hasPrivateKey && c.apiV3KeyMasked)
+    };
+  }
+
+  function miniprogramView(db) {
+    var m = db.pay.miniprogram;
+    return {
+      appId: m.appId || '',
+      appSecretMasked: m.appSecretMasked || '',
+      hasAppSecret: !!m.hasAppSecret,
+      envVersion: m.envVersion || 'release',
+      configured: !!(m.appId && m.hasAppSecret),
+      homePage: 'pages/menu/index'
+    };
+  }
+
+  function ensurePlatformBrand(db, row) {
+    var map = db.platformData.brands || (db.platformData.brands = {});
+    if (map[row.id]) { map[row.id].banners = parseBanners(map[row.id].banners); return map[row.id]; }
+    var brand;
+    if (row.code === 'demo') {
+      brand = clone(db.brand);
+    } else if (db.platformData.tenantDetail && db.platformData.tenantDetail.id === row.id) {
+      brand = clone(db.platformData.tenantDetail.brand || {});
+    } else {
+      brand = {
+        logoUrl: '', coverUrl: '', primaryColor: '#FF5A1F', accentColor: '#F2B544',
+        slogan: '扫码点单，先人一步', announcement: '', servicePhone: row.contactPhone || '',
+        copyright: '', banners: []
+      };
+    }
+    brand.tenantId = brand.tenantId || row.id;
+    brand.banners = parseBanners(brand.banners);
+    map[row.id] = brand;
+    return brand;
+  }
+
+  function tenantBrandView(db, row) {
+    var brand = ensurePlatformBrand(db, row);
+    var out = clone(brand);
+    out.banners = parseBanners(brand.banners);
+    return { tenant: { name: row.name }, brand: out };
+  }
+
+  function tenantDetailView(db, row) {
+    var brand = ensurePlatformBrand(db, row);
+    var detail;
+    if (row.code === 'demo') {
+      detail = clone(row);
+      detail.brand = clone(brand);
+      detail.store = clone(db.store);
+      detail.staff = db.staff.map(function (s) {
+        return { id: s.id, username: s.username, name: s.name, role: s.role, status: 'ACTIVE' };
+      });
+      detail.paymentConfig = {
+        appId: db.pay.miniprogram.appId || '',
+        mchId: db.pay.config.mchId || '',
+        enabled: !!db.pay.config.enabled,
+        verifiedAt: db.pay.config.verifiedAt || null,
+        statusMsg: db.pay.config.statusMsg || null,
+        mockAllowed: true
+      };
+      var paid = db.orders.filter(function (o) { return o.payStatus === 'PAID'; });
+      var today = dayStart(new Date());
+      detail.stats = {
+        gmv: paid.reduce(function (s, o) { return s + (o.paidAmount || 0); }, 0),
+        orderCount: db.orders.length,
+        todayOrders: paid.filter(function (o) { return o.paidAt && new Date(o.paidAt).getTime() >= today; }).length
+      };
+      detail._count = {
+        orders: db.orders.length,
+        categories: db.categories.length,
+        products: db.products.length,
+        tables: db.tables.length
+      };
+    } else if (db.platformData.tenantDetail && db.platformData.tenantDetail.id === row.id) {
+      detail = clone(db.platformData.tenantDetail);
+      detail.brand = clone(brand);
+      detail.paymentConfig = detail.paymentConfig || { enabled: false, mockAllowed: true };
+      detail.stats = detail.stats || { gmv: row.gmv || 0, orderCount: row.orderCount || 0, todayOrders: 0 };
+      detail._count = detail._count || {
+        orders: row.orderCount || 0,
+        categories: (detail.stats && detail.stats.categoryCount) || 0,
+        products: 0,
+        tables: 0
+      };
+      detail.staff = detail.staff || [];
+    } else {
+      detail = clone(row);
+      detail.brand = clone(brand);
+      detail.store = (db.platformData.extraStores && db.platformData.extraStores[row.id]) || null;
+      detail.staff = (db.platformData.extraStaff && db.platformData.extraStaff[row.id]) || [];
+      detail.staff = detail.staff.map(function (s) {
+        return { id: s.id, username: s.username, name: s.name, role: s.role, status: s.status || 'ACTIVE' };
+      });
+      detail.paymentConfig = { enabled: false, mockAllowed: true };
+      detail.stats = { gmv: row.gmv || 0, orderCount: row.orderCount || 0, todayOrders: 0 };
+      detail._count = { orders: row.orderCount || 0, categories: 0, products: 0, tables: 0 };
+    }
+    return detail;
+  }
+
+
   /* ------------------------------ 认证 ------------------------------ */
   function staffMe(db, staff) {
     return {
@@ -483,27 +664,32 @@
     requireStaff(db, ctx.req);
     var idx = db.categories.findIndex(function (c) { return c.id === ctx.params.id; });
     if (idx < 0) throw httpError(404, '分类不存在');
+    var used = db.products.filter(function (p) { return p.categoryId === ctx.params.id; }).length;
+    if (used > 0) throw httpError(400, '该分类下还有菜品，请先移动或删除菜品');
     db.categories.splice(idx, 1);
-    db.products = db.products.filter(function (p) { return p.categoryId !== ctx.params.id; });
     save(db);
-    return ok({ ok: true });
+    return ok({ success: true });
   });
 
   /* ---------- 商户：菜品 ---------- */
   route('GET', '/api/admin/menu/products', function (ctx) {
     var db = ctx.db;
     requireStaff(db, ctx.req);
-    return ok(db.products.slice().sort(function (a, b) { return a.sort - b.sort; }));
+    var list = db.products.slice().sort(function (a, b) { return (a.sort || 0) - (b.sort || 0); });
+    return ok(list.map(function (p) { return serializeProduct(db, p); }));
   });
 
   function applyProductBody(db, product, b) {
     var cat = db.categories.find(function (c) { return c.id === b.categoryId; });
-    ['name', 'description', 'imageUrl', 'price', 'originalPrice', 'unit', 'tags', 'stockEnabled', 'stock', 'soldOut', 'status', 'sort'].forEach(function (k) {
+    ['name', 'description', 'imageUrl', 'originalPrice', 'unit', 'stockEnabled', 'stock', 'soldOut', 'status', 'sort'].forEach(function (k) {
       if (b[k] !== undefined) product[k] = b[k];
     });
-    product.categoryId = b.categoryId || product.categoryId;
+    if (b.price !== undefined) product.price = Number(b.price) || 0;
+    if (b.categoryId) product.categoryId = b.categoryId;
+    if (Array.isArray(b.tags)) product.tags = b.tags.join(',');
+    else if (b.tags !== undefined) product.tags = b.tags;
     if (cat) product.category = { id: cat.id, name: cat.name };
-    if (b.specGroups !== undefined) product.specGroups = b.specGroups;
+    if (b.specGroups !== undefined) product.specGroups = normalizeSpecGroups(b.specGroups);
     product.updatedAt = nowIso();
     return product;
   }
@@ -512,18 +698,20 @@
     var db = ctx.db;
     requireStaff(db, ctx.req);
     var b = ctx.body || {};
+    var categoryId = b.categoryId || (db.categories[0] && db.categories[0].id);
+    if (!db.categories.find(function (c) { return c.id === categoryId; })) throw httpError(400, '请先选择菜品分类');
     var product = {
-      id: uid('prod'), tenantId: db.tenant.id, storeId: db.store.id, categoryId: b.categoryId || (db.categories[0] && db.categories[0].id),
+      id: uid('prod'), tenantId: db.tenant.id, storeId: db.store.id, categoryId: categoryId,
       name: b.name || '新菜品', description: b.description || '', imageUrl: b.imageUrl || null,
       price: typeof b.price === 'number' ? b.price : 0, originalPrice: b.originalPrice || null, unit: b.unit || '份',
-      monthlySales: 0, tags: b.tags || '', stockEnabled: !!b.stockEnabled, stock: b.stock || 0, soldOut: !!b.soldOut,
+      monthlySales: 0, tags: '', stockEnabled: !!b.stockEnabled, stock: Number(b.stock) || 0, soldOut: !!b.soldOut,
       status: b.status || 'ON', sort: typeof b.sort === 'number' ? b.sort : db.products.length,
-      createdAt: nowIso(), updatedAt: nowIso(), specGroups: b.specGroups || []
+      createdAt: nowIso(), updatedAt: nowIso(), specGroups: []
     };
-    applyProductBody(db, product, { specGroups: product.specGroups });
+    applyProductBody(db, product, b);
     db.products.push(product);
     save(db);
-    return ok(product);
+    return ok(serializeProduct(db, product));
   });
 
   route('PUT', '/api/admin/menu/products/:id', function (ctx) {
@@ -533,7 +721,7 @@
     if (!product) throw httpError(404, '菜品不存在');
     applyProductBody(db, product, ctx.body || {});
     save(db);
-    return ok(product);
+    return ok(serializeProduct(db, product));
   });
 
   route('DELETE', '/api/admin/menu/products/:id', function (ctx) {
@@ -566,37 +754,58 @@
     if (!product) throw httpError(404, '菜品不存在');
     var copy = clone(product);
     copy.id = uid('prod');
-    copy.name = product.name + '（副本）';
+    copy.name = String(product.name + '（复制）').slice(0, 40);
+    copy.status = 'OFF';
+    copy.sort = (product.sort || 0) + 1;
+    copy.monthlySales = 0;
+    copy.specGroups = normalizeSpecGroups(freshSpecGroups(product.specGroups));
     copy.createdAt = nowIso();
     copy.updatedAt = nowIso();
     db.products.push(copy);
     save(db);
-    return ok(copy);
+    return ok(serializeProduct(db, copy));
   });
 
   /* ---------- 商户：订单 ---------- */
-  function filterOrders(db, query) {
-    var list = db.orders.slice().sort(function (a, b) { return new Date(b.createdAt) - new Date(a.createdAt); });
-    if (query.status && query.status !== 'ALL') list = list.filter(function (o) { return o.status === query.status; });
-    if (query.keyword) {
-      var kw = String(query.keyword).toLowerCase();
-      list = list.filter(function (o) {
-        return String(o.orderNo).toLowerCase().indexOf(kw) >= 0 || String(o.tableName || '').toLowerCase().indexOf(kw) >= 0;
-      });
-    }
-    return list;
+  function orderMatcher(db, query) {
+    var q = query || {};
+    var kw = q.keyword ? String(q.keyword).trim().toLowerCase() : '';
+    var fromT = q.dateFrom ? dayStart(new Date(q.dateFrom + 'T00:00:00')) : null;
+    var toT = q.dateTo ? dayEnd(new Date(q.dateTo + 'T00:00:00')) : null;
+    return function (o) {
+      if (kw) {
+        var hay = (String(o.orderNo) + ' ' + String(o.tableName || '')).toLowerCase();
+        if (hay.indexOf(kw) < 0) return false;
+      }
+      if (fromT !== null || toT !== null) {
+        var t = new Date(o.createdAt).getTime();
+        if (fromT !== null && t < fromT) return false;
+        if (toT !== null && t > toT) return false;
+      }
+      return true;
+    };
   }
 
   route('GET', '/api/admin/orders', function (ctx) {
     var db = ctx.db;
     requireStaff(db, ctx.req);
-    var q = ctx.query;
-    var page = Number(q.page || 1), pageSize = Number(q.pageSize || 20);
-    var all = filterOrders(db, q);
-    var counts = { CANCELLED: 0, COMPLETED: 0, PENDING: 0, PREPARING: 0, READY: 0 };
-    db.orders.forEach(function (o) { if (counts[o.status] !== undefined) counts[o.status] += 1; });
-    var slice = all.slice((page - 1) * pageSize, page * pageSize);
-    return ok({ list: slice.map(serializeOrder), total: all.length, page: page, pageSize: pageSize, counts: counts });
+    var q = ctx.query || {};
+    var page = Math.max(1, Number(q.page || 1));
+    var pageSize = Math.max(1, Math.min(200, Number(q.pageSize || 20)));
+    var matched = orderMatcher(db, q);
+    var base = db.orders.filter(matched);
+    var list = base.slice();
+    if (q.status && q.status !== 'ALL') list = list.filter(function (o) { return o.status === q.status; });
+    list.sort(function (a, b) { return new Date(b.createdAt) - new Date(a.createdAt); });
+    var counts = {};
+    base.forEach(function (o) { counts[o.status] = (counts[o.status] || 0) + 1; });
+    return ok({
+      list: list.slice((page - 1) * pageSize, page * pageSize).map(serializeOrder),
+      total: list.length,
+      page: page,
+      pageSize: pageSize,
+      counts: counts
+    });
   });
 
   route('GET', '/api/admin/orders/:id', function (ctx) {
@@ -618,26 +827,71 @@
 
   route('POST', '/api/admin/orders/:id/:action', function (ctx) {
     var db = ctx.db;
-    requireStaff(db, ctx.req);
+    var staff = requireStaff(db, ctx.req);
     var order = db.orders.find(function (o) { return o.id === ctx.params.id; });
     if (!order) throw httpError(404, '订单不存在');
     var action = ctx.params.action;
     var b = ctx.body || {};
-    if (action === 'accept') transitionTo(order, 'PREPARING', { acceptAt: nowIso() });
-    else if (action === 'reject') transitionTo(order, 'CANCELLED', { cancelAt: nowIso(), cancelReason: b.reason || '商家拒单' });
-    else if (action === 'ready') transitionTo(order, 'READY', { readyAt: nowIso() });
-    else if (action === 'undo-ready') {
-      if (order.status !== 'READY') throw httpError(400, '订单当前状态为「' + ORDER_STATUS_TEXT[order.status] + '」，无法执行该操作');
-      order.status = 'PREPARING'; order.readyAt = null; order.updatedAt = nowIso();
-    } else if (action === 'complete') transitionTo(order, 'COMPLETED', { completeAt: nowIso() });
-    else if (action === 'cancel') {
-      transitionTo(order, 'CANCELLED', { cancelAt: nowIso(), cancelReason: b.reason || '商家取消' });
-      if (order.payStatus === 'PAID') { order.payStatus = 'REFUNDED'; order.paidAmount = 0; }
+    if (action === 'accept') {
+      transitionTo(order, 'PREPARING', { acceptAt: nowIso() });
+    } else if (action === 'reject') {
+      transitionTo(order, 'CANCELLED', {
+        cancelAt: nowIso(),
+        cancelReason: b.reason || '商家拒单',
+        payStatus: order.payStatus === 'PAID' ? 'REFUNDED' : 'CLOSED'
+      });
+    } else if (action === 'ready') {
+      transitionTo(order, 'READY', { readyAt: nowIso() });
+    } else if (action === 'undo-ready') {
+      if (order.status !== 'READY') throw httpError(400, '仅待取餐的订单可撤销出餐');
+      order.status = 'PREPARING';
+      order.readyAt = null;
+      order.updatedAt = nowIso();
+      save(db);
+      return ok(serializeOrder(order));
+    } else if (action === 'complete') {
+      transitionTo(order, 'COMPLETED', { completeAt: nowIso() });
+    } else if (action === 'cancel') {
+      if (order.status === 'COMPLETED' || order.status === 'CANCELLED') throw httpError(400, '订单已结束，无法取消');
+      var cancelReason = b.reason || '商家取消';
+      if (order.payStatus === 'PAID') {
+        order.payStatus = 'REFUNDED';
+        order.status = 'CANCELLED';
+        order.cancelAt = nowIso();
+        order.cancelReason = cancelReason;
+        order.refunds = order.refunds || [];
+        order.refunds.push({
+          id: uid('rf'),
+          orderId: order.id,
+          tenantId: order.tenantId,
+          refundNo: 'RF' + Date.now(),
+          amount: order.paidAmount || order.totalAmount,
+          status: 'SUCCESS',
+          reason: cancelReason,
+          operatorName: staff.name,
+          finishedAt: nowIso(),
+          createdAt: nowIso()
+        });
+        order.updatedAt = nowIso();
+        save(db);
+        return ok({ success: true, refunded: true, order: serializeOrder(order) });
+      }
+      order.status = 'CANCELLED';
+      order.payStatus = 'CLOSED';
+      order.cancelAt = nowIso();
+      order.cancelReason = cancelReason;
+      order.updatedAt = nowIso();
+      save(db);
+      return ok({ success: true, refunded: false, order: serializeOrder(order) });
     } else if (action === 'refund') {
-      if (order.payStatus !== 'PAID') throw httpError(400, '订单未支付，无需退款');
-      order.payStatus = 'REFUNDED'; order.paidAmount = 0; order.updatedAt = nowIso();
+      if (order.payStatus !== 'PAID') throw httpError(400, '该订单未支付或已退款');
+      order.payStatus = 'REFUNDED';
+      order.status = 'CANCELLED';
+      order.cancelAt = order.cancelAt || nowIso();
+      order.cancelReason = b.reason || '商家退款';
+      order.updatedAt = nowIso();
     } else if (action === 'append') {
-      throw httpError(400, '演示环境不支持加菜');
+      throw httpError(400, '请通过顾客端加菜接口操作');
     } else {
       throw httpError(400, '未知操作：' + action);
     }
@@ -649,14 +903,19 @@
   route('GET', '/api/admin/tables', function (ctx) {
     var db = ctx.db;
     requireStaff(db, ctx.req);
-    var list = db.tables.slice().sort(function (a, b) { return String(a.name).localeCompare(String(b.name)); });
+    var list = db.tables.slice().sort(function (a, b) {
+      var areaCmp = String(a.area || '').localeCompare(String(b.area || ''));
+      if (areaCmp !== 0) return areaCmp;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
     var areas = [];
     list.forEach(function (t) { if (areas.indexOf(t.area) < 0) areas.push(t.area); });
+    var mp = db.pay.miniprogram || {};
     return ok({
       total: list.length,
       areas: areas,
       publicBaseUrl: publicBaseUrl(),
-      miniprogram: { configured: false, envVersion: 'release' },
+      miniprogram: { configured: !!(mp.appId && mp.hasAppSecret), envVersion: mp.envVersion || 'release' },
       list: list.map(function (t) { return serializeTable(db, t); })
     });
   });
@@ -665,10 +924,12 @@
     var db = ctx.db;
     requireStaff(db, ctx.req);
     var b = ctx.body || {};
+    var name = String(b.name || ('新桌' + (db.tables.length + 1))).trim();
+    if (db.tables.some(function (t) { return t.name === name; })) throw httpError(400, '该桌号已存在');
     var table = {
       id: uid('tbl'), tenantId: db.tenant.id, storeId: db.store.id,
       sceneCode: b.sceneCode || uid('s').slice(-10).toLowerCase(),
-      area: b.area || '大厅', name: b.name || ('新桌' + db.tables.length), seats: b.seats || 4,
+      area: b.area || '大厅', name: name, seats: Number(b.seats) || 4,
       qrCodeUrl: null, createdAt: nowIso()
     };
     db.tables.push(table);
@@ -701,22 +962,26 @@
     var db = ctx.db;
     requireStaff(db, ctx.req);
     var b = ctx.body || {};
-    var count = Math.max(1, Math.min(50, Number(b.count) || 1));
-    var start = Number(b.start) || 1;
-    var created = [];
-    for (var i = 0; i < count; i++) {
-      var name = (b.prefix || 'A') + pad(start + i);
-      var table = {
+    var count = Math.max(1, Math.min(200, Number(b.count) || 1));
+    var start = Math.max(1, Number(b.start) || 1);
+    var prefix = String(b.prefix || 'A');
+    var names = [];
+    for (var i = 0; i < count; i++) names.push(prefix + pad(start + i));
+    var duplicated = names.filter(function (n) {
+      return db.tables.some(function (t) { return t.name === n; });
+    });
+    if (duplicated.length) throw httpError(400, '桌号 ' + duplicated.join('、') + ' 已存在');
+    var area = b.area || '大厅';
+    var seats = Number(b.seats) || 4;
+    names.forEach(function (n) {
+      db.tables.push({
         id: uid('tbl'), tenantId: db.tenant.id, storeId: db.store.id,
         sceneCode: uid('s').slice(-10).toLowerCase(),
-        area: b.area || '大厅', name: name, seats: Number(b.seats) || 4,
-        qrCodeUrl: null, createdAt: nowIso()
-      };
-      db.tables.push(table);
-      created.push(table);
-    }
+        area: area, name: n, seats: seats, qrCodeUrl: null, createdAt: nowIso()
+      });
+    });
     save(db);
-    return ok({ created: created.length, list: created.map(function (t) { return serializeTable(db, t); }) });
+    return ok({ success: true, created: names.length });
   });
 
   /* ---------- 商户：统计 ---------- */
@@ -736,31 +1001,79 @@
   /* ---------- 商户：支付配置 ---------- */
   route('GET', '/api/admin/pay/config', function (ctx) {
     requireStaff(ctx.db, ctx.req);
-    return ok(ctx.db.pay.config);
+    return ok(payConfigView(ctx.db));
   });
+
   route('PUT', '/api/admin/pay/config', function (ctx) {
     var db = ctx.db;
     requireStaff(db, ctx.req);
-    Object.keys(ctx.body || {}).forEach(function (k) { if (k in db.pay.config) db.pay.config[k] = ctx.body[k]; });
-    db.pay.config.ready = !!(db.pay.config.mchId && db.pay.config.serialNo && db.pay.config.hasPrivateKey);
+    var b = ctx.body || {};
+    var c = db.pay.config;
+    if (b.appId !== undefined) c.appId = String(b.appId || '').trim();
+    if (b.mchId !== undefined) c.mchId = String(b.mchId || '').trim();
+    if (b.serialNo !== undefined) c.serialNo = String(b.serialNo || '').trim();
+    if (b.enabled !== undefined) c.enabled = !!b.enabled;
+    if (b.appSecret) c.appSecretMasked = maskSecret(String(b.appSecret).trim());
+    if (b.apiV3Key !== undefined && String(b.apiV3Key).trim()) {
+      var apiV3Key = String(b.apiV3Key).trim();
+      if (apiV3Key.length !== 32) throw httpError(400, 'APIv3 密钥必须为 32 位');
+      c.apiV3KeyMasked = maskSecret(apiV3Key);
+    }
+    if (b.privateKey !== undefined && String(b.privateKey).trim()) {
+      var pem = String(b.privateKey).trim();
+      if (pem.indexOf('BEGIN') < 0 || pem.indexOf('PRIVATE KEY') < 0) {
+        throw httpError(400, '商户私钥格式不正确，请上传 apiclient_key.pem 内容');
+      }
+      c.hasPrivateKey = true;
+      c.privateKeyMasked = '已上传，如需更换请重新上传';
+    }
+    c.ready = !!(c.enabled && c.mchId && c.hasPrivateKey && c.apiV3KeyMasked);
     save(db);
-    return ok(db.pay.config);
+    return ok(payConfigView(db));
   });
+
   route('POST', '/api/admin/pay/config/test', function (ctx) {
-    requireStaff(ctx.db, ctx.req);
-    return ok({ ok: true, message: '演示环境：未接入真实微信支付，当前使用模拟支付（ALLOW_MOCK_PAY=true）' });
+    var db = ctx.db;
+    requireStaff(db, ctx.req);
+    var view = payConfigView(db);
+    var missing = [
+      !view.mchId && '商户号',
+      !view.serialNo && '证书序列号',
+      !view.hasPrivateKey && '商户私钥',
+      !view.apiV3KeyMasked && 'APIv3 密钥',
+      !view.appId && 'AppID'
+    ].filter(Boolean);
+    if (missing.length) throw httpError(400, '请先补全：' + missing.join('、'));
+    db.pay.config.verifiedAt = nowIso();
+    db.pay.config.statusMsg = '连接正常';
+    db.pay.config.enabled = true;
+    db.pay.config.ready = true;
+    save(db);
+    return ok({ success: true, certCount: 3, message: '配置校验通过，可以正常收款' });
   });
+
   route('GET', '/api/admin/pay/miniprogram', function (ctx) {
     requireStaff(ctx.db, ctx.req);
-    return ok(ctx.db.pay.miniprogram);
+    return ok(miniprogramView(ctx.db));
   });
+
   route('PUT', '/api/admin/pay/miniprogram', function (ctx) {
     var db = ctx.db;
     requireStaff(db, ctx.req);
-    Object.keys(ctx.body || {}).forEach(function (k) { if (k in db.pay.miniprogram) db.pay.miniprogram[k] = ctx.body[k]; });
-    db.pay.miniprogram.configured = !!(db.pay.miniprogram.appId && db.pay.miniprogram.hasAppSecret);
+    var b = ctx.body || {};
+    var m = db.pay.miniprogram;
+    if (b.appId !== undefined) m.appId = String(b.appId || '').trim();
+    if (b.envVersion) m.envVersion = b.envVersion;
+    if (b.appSecret) {
+      var secret = String(b.appSecret).trim();
+      if (secret.length < 16) throw httpError(400, 'AppSecret 长度不正确，请从微信公众平台复制完整密钥');
+      m.hasAppSecret = true;
+      m.appSecretMasked = maskSecret(secret);
+    }
+    m.configured = !!(m.appId && m.hasAppSecret);
+    m.homePage = 'pages/menu/index';
     save(db);
-    return ok(db.pay.miniprogram);
+    return ok(miniprogramView(db));
   });
 
   /* ---------- 商户：上传（转 dataURL） ---------- */
@@ -795,45 +1108,73 @@
     requirePlatform(ctx.db, ctx.req);
     var db = ctx.db;
     var q = ctx.query || {};
-    var list = db.platformData.tenants.slice();
+    var rows = db.platformData.tenants.slice();
+    if (q.status && q.status !== 'ALL') rows = rows.filter(function (t) { return t.status === q.status; });
     if (q.keyword) {
-      var kw = String(q.keyword).toLowerCase();
-      list = list.filter(function (t) { return (t.name + t.code).toLowerCase().indexOf(kw) >= 0; });
+      var kw = String(q.keyword).trim().toLowerCase();
+      rows = rows.filter(function (t) {
+        return [t.name, t.code, t.contactName, t.contactPhone].some(function (v) {
+          return String(v || '').toLowerCase().indexOf(kw) >= 0;
+        });
+      });
     }
-    var page = Number(q.page || 1), pageSize = Number(q.pageSize || 20);
-    return ok({ list: list.slice((page - 1) * pageSize, page * pageSize), total: list.length, page: page, pageSize: pageSize });
+    var page = Math.max(1, Number(q.page || 1));
+    var pageSize = Math.max(1, Number(q.pageSize || 20));
+    return ok({ list: rows.slice((page - 1) * pageSize, page * pageSize), total: rows.length, page: page, pageSize: pageSize });
   });
 
   route('POST', '/api/platform/tenants', function (ctx) {
     var db = ctx.db;
     requirePlatform(db, ctx.req);
     var b = ctx.body || {};
+    var code = String(b.code || '').trim() || ('t' + Date.now().toString(36).slice(-4) + Math.random().toString(36).slice(2, 8)).toLowerCase();
+    var ownerUsername = String(b.ownerUsername || '').trim() || String(b.contactPhone || code);
+    var ownerPassword = String(b.ownerPassword || '123456');
+    var name = String(b.name || '新商户').trim();
+    var now = nowIso();
+    var expireAt = b.expireAt || new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
     var row = {
-      id: uid('ten'), code: b.code || uid('t').slice(-8), name: b.name || '新商户',
+      id: uid('ten'), code: code, name: name,
       contactName: b.contactName || '', contactPhone: b.contactPhone || '', status: 'ACTIVE', plan: b.plan || 'PRO',
-      expireAt: b.expireAt || nowIso(), createdAt: nowIso(), storeName: '', openStatus: false,
+      expireAt: expireAt, createdAt: now, storeName: name + '（总店）', openStatus: true,
       orderCount: 0, staffCount: 1, gmv: 0
     };
     db.platformData.tenants.unshift(row);
+    var brands = db.platformData.brands || (db.platformData.brands = {});
+    brands[row.id] = {
+      tenantId: row.id, logoUrl: '', coverUrl: '', primaryColor: '#FF5A1F', accentColor: '#F2B544',
+      slogan: '扫码点单，先人一步', announcement: '', servicePhone: row.contactPhone || '', copyright: '', banners: []
+    };
+    var extraStaff = db.platformData.extraStaff || (db.platformData.extraStaff = {});
+    extraStaff[row.id] = [{
+      id: uid('staff'), username: ownerUsername, password: ownerPassword,
+      name: row.contactName || '老板', role: 'OWNER', status: 'ACTIVE'
+    }];
+    var extraStores = db.platformData.extraStores || (db.platformData.extraStores = {});
+    extraStores[row.id] = {
+      id: uid('store'), tenantId: row.id, name: row.storeName, address: '', phone: row.contactPhone || '',
+      businessHours: '10:00-22:00', openStatus: true, autoAccept: false, packingFee: 200, minOrderAmount: 1500,
+      deliveryFee: 300, deliveryMinAmount: 2000, deliveryRange: '3 公里内配送', deliveryEta: 35,
+      fullReduceThreshold: 0, fullReduceAmount: 0, notice: '', createdAt: now, updatedAt: now
+    };
     save(db);
-    return ok(row);
+    return ok(Object.assign({}, row, { ownerUsername: ownerUsername, loginCode: row.code }));
   });
 
   route('GET', '/api/platform/tenants/:id', function (ctx) {
-    requirePlatform(ctx.db, ctx.req);
     var db = ctx.db;
+    requirePlatform(db, ctx.req);
     var row = db.platformData.tenants.find(function (t) { return t.id === ctx.params.id; });
     if (!row) throw httpError(404, '商户不存在');
-    var detail = clone(db.platformData.tenantDetail || {});
-    if (detail.id === row.id) return ok(detail);
-    var synthetic = clone(row);
-    synthetic.brand = clone(db.brand);
-    synthetic.store = clone(db.store);
-    synthetic.staff = [{ id: 'staff-' + row.id, username: row.code, name: row.contactName || '老板', role: 'OWNER', status: 'ACTIVE' }];
-    synthetic.paymentConfig = { enabled: false, mockAllowed: true };
-    synthetic._count = { orders: row.orderCount || 0, staff: (synthetic.staff || []).length };
-    synthetic.stats = { orderCount: row.orderCount || 0, gmv: row.gmv || 0 };
-    return ok(synthetic);
+    return ok(tenantDetailView(db, row));
+  });
+
+  route('GET', '/api/platform/tenants/:id/brand', function (ctx) {
+    var db = ctx.db;
+    requirePlatform(db, ctx.req);
+    var row = db.platformData.tenants.find(function (t) { return t.id === ctx.params.id; });
+    if (!row) throw httpError(404, '商户不存在');
+    return ok(tenantBrandView(db, row));
   });
 
   route('PUT', '/api/platform/tenants/:id', function (ctx) {
@@ -860,19 +1201,46 @@
     requirePlatform(db, ctx.req);
     var row = db.platformData.tenants.find(function (t) { return t.id === ctx.params.id; });
     if (!row) throw httpError(404, '商户不存在');
-    var detail = db.platformData.tenantDetail;
-    if (detail && detail.id === row.id) {
-      detail.brand = detail.brand || {};
-      Object.keys(ctx.body || {}).forEach(function (k) { if (k in detail.brand) detail.brand[k] = ctx.body[k]; });
-      if (ctx.body.banners) detail.brand.banners = JSON.stringify(ctx.body.banners);
+    var b = ctx.body || {};
+    if (b.primaryColor && b.accentColor && b.primaryColor === b.accentColor) {
+      throw httpError(400, '主题色与辅助色不能相同');
+    }
+    var brand = ensurePlatformBrand(db, row);
+    ['logoUrl', 'coverUrl', 'primaryColor', 'accentColor', 'slogan', 'announcement', 'servicePhone', 'copyright'].forEach(function (k) {
+      if (b[k] !== undefined) brand[k] = b[k];
+    });
+    if (b.banners !== undefined) brand.banners = Array.isArray(b.banners) ? b.banners : parseBanners(b.banners);
+    if (row.code === 'demo') {
+      ['logoUrl', 'coverUrl', 'primaryColor', 'accentColor', 'slogan', 'announcement', 'servicePhone', 'copyright'].forEach(function (k) {
+        if (b[k] !== undefined) db.brand[k] = b[k];
+      });
+      if (b.banners !== undefined) db.brand.banners = brand.banners;
+    }
+    var seedDetail = db.platformData.tenantDetail;
+    if (seedDetail && seedDetail.id === row.id) {
+      seedDetail.brand = Object.assign({}, clone(seedDetail.brand || {}), clone(brand), { banners: JSON.stringify(parseBanners(brand.banners)) });
     }
     save(db);
-    return ok(detail && detail.brand);
+    return ok(tenantBrandView(db, row));
   });
 
   route('POST', '/api/platform/tenants/:id/owner-password', function (ctx) {
-    requirePlatform(ctx.db, ctx.req);
-    return ok({ ok: true });
+    var db = ctx.db;
+    requirePlatform(db, ctx.req);
+    var row = db.platformData.tenants.find(function (t) { return t.id === ctx.params.id; });
+    if (!row) throw httpError(404, '商户不存在');
+    var password = String((ctx.body || {}).password || '');
+    if (password.length < 6) throw httpError(400, '密码至少 6 位');
+    var username = row.code;
+    if (row.code === 'demo') {
+      var owner = db.staff.find(function (s) { return s.role === 'OWNER'; });
+      if (owner) { owner.password = password; username = owner.username; }
+    } else if (db.platformData.extraStaff && db.platformData.extraStaff[row.id] && db.platformData.extraStaff[row.id][0]) {
+      db.platformData.extraStaff[row.id][0].password = password;
+      username = db.platformData.extraStaff[row.id][0].username;
+    }
+    save(db);
+    return ok({ success: true, username: username });
   });
 
   /* ---------- 顾客端 ---------- */
