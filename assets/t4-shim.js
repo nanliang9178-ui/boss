@@ -151,42 +151,56 @@
   }
 
   function priceItems(db, items) {
+    if (!items || !items.length) throw httpError(400, '请先选择菜品');
     var priced = [];
     var itemAmount = 0;
-    (items || []).forEach(function (line) {
+    items.forEach(function (line) {
       var product = db.products.find(function (p) { return p.id === line.productId; });
-      if (!product) throw httpError(400, '菜品不存在或已下架');
-      if (product.status !== 'ON' || product.soldOut) throw httpError(400, '「' + product.name + '」已售罄');
-      if (product.stockEnabled && product.stock < line.quantity) throw httpError(400, '「' + product.name + '」库存不足');
-      var unitPrice = product.price;
-      var specTexts = [];
-      (product.specGroups || []).forEach(function (group) {
-        var selected = (group.options || []).filter(function (opt) {
-          return (line.specOptionIds || []).indexOf(opt.id) >= 0;
+      if (!product) throw httpError(400, '部分菜品已删除，请刷新菜单后重试');
+      if (product.status !== 'ON') throw httpError(400, '「' + product.name + '」已下架');
+      if (product.soldOut) throw httpError(400, '「' + product.name + '」已售罄');
+      if (product.stockEnabled && product.stock < line.quantity) {
+        throw httpError(400, '「' + product.name + '」库存不足，仅剩 ' + product.stock + ' 份');
+      }
+      var quantity = Number(line.quantity);
+      if (!isFinite(quantity) || Math.floor(quantity) !== quantity || quantity < 1) throw httpError(400, '数量至少为 1');
+      if (quantity > 99) throw httpError(400, '单项最多 99 份');
+
+      var selectedIds = Array.isArray(line.specOptionIds) ? line.specOptionIds : [];
+      var groups = product.specGroups || [];
+      var allOptions = [];
+      groups.forEach(function (group) {
+        (group.options || []).forEach(function (option) {
+          allOptions.push({ id: option.id, name: option.name, priceDelta: option.priceDelta || 0, groupId: group.id, groupName: group.name });
         });
-        if (!selected.length) {
-          var dft = (group.options || []).filter(function (opt) { return opt.defaultSelected; });
-          if (group.required && dft.length) selected = dft.slice(0, 1);
-        }
-        selected.forEach(function (opt) { unitPrice += opt.priceDelta || 0; });
-        if (selected.length) {
-          specTexts.push(group.name + ':' + selected.map(function (o) { return o.name; }).join('+'));
-        }
       });
-      var amount = unitPrice * line.quantity;
+      var selected = allOptions.filter(function (option) { return selectedIds.indexOf(option.id) >= 0; });
+      if (selected.length !== selectedIds.length) throw httpError(400, '「' + product.name + '」规格选择有误，请重新选择');
+
+      groups.forEach(function (group) {
+        var picked = selected.filter(function (option) { return option.groupId === group.id; });
+        if (group.required && picked.length === 0) throw httpError(400, '请选择「' + product.name + '」的' + group.name);
+        if (!group.multiple && picked.length > 1) throw httpError(400, '「' + product.name + '」的' + group.name + '只能选择一项');
+      });
+
+      var delta = selected.reduce(function (sum, option) { return sum + (option.priceDelta || 0); }, 0);
+      var unitPrice = product.price + delta;
+      var parts = [];
+      groups.forEach(function (group) {
+        var names = selected.filter(function (option) { return option.groupId === group.id; }).map(function (option) { return option.name; });
+        if (names.length) parts.push(group.name + ':' + names.join('+'));
+      });
+      var amount = unitPrice * quantity;
       itemAmount += amount;
       priced.push({
         id: uid('oi'),
-        orderId: '',
-        tenantId: db.tenant.id,
         productId: product.id,
         productName: product.name,
         imageUrl: product.imageUrl || null,
         unitPrice: unitPrice,
-        quantity: line.quantity,
+        quantity: quantity,
         amount: amount,
-        specText: specTexts.length ? specTexts.join(' / ') : null,
-        addonText: null,
+        specText: parts.length ? parts.join(' / ') : null,
         remark: line.remark || null
       });
     });
@@ -443,9 +457,11 @@
 
   function resolveCustomer(db, req) {
     var token = authOf(req);
+    if (!token) throw httpError(401, '请先登录');
     var id = token.indexOf('mock-h5:') === 0 ? token.slice('mock-h5:'.length) : '';
+    if (!id) throw httpError(401, '登录状态已失效，请重新登录');
     var customer = db.customers.find(function (c) { return c.id === id; });
-    if (!customer) throw httpError(401, '登录已过期，请重新扫码');
+    if (!customer) throw httpError(401, '登录状态已失效，请重新登录');
     return customer;
   }
 
@@ -1243,130 +1259,216 @@
     return ok({ success: true, username: username });
   });
 
-  /* ---------- 顾客端 ---------- */
-  route('POST', '/api/h5/login', function (ctx) {
-    var db = ctx.db;
-    var b = ctx.body || {};
-    var scene = String(b.scene || '');
-    var table = db.tables.find(function (t) { return t.sceneCode === scene || t.name === scene; });
-    if (!table) throw httpError(404, '桌码无效，请重新扫描桌面上的点单二维码');
-    var clientId = b.clientId || 'anon';
-    var customer = db.customers.find(function (c) { return c.clientId === clientId; });
-    if (!customer) {
-      var names = ['小满', '阿哲', '团团', '阿猹', '七月'];
-      customer = {
-        id: uid('cust'),
-        clientId: clientId,
-        nickname: names[db.customers.length % names.length],
-        phone: '138****' + String(1000 + Math.floor(Math.random() * 8999))
-      };
-      db.customers.push(customer);
-      save(db);
+  /* ---------- 顾客端（照抄 h5.service / client.service / order.service / pay.service） ---------- */
+  var H5_DEFAULT_TENANT_CODE = (SEED && SEED.tenant && SEED.tenant.code) || 'demo';
+
+  function h5ParseBanners(raw) {
+    try {
+      var list = JSON.parse(raw || '[]');
+      if (!Array.isArray(list)) return [];
+      return list.filter(function (item) { return item && item.url; });
+    } catch (e) {
+      return [];
     }
-    return ok({
-      token: 'mock-h5:' + customer.id,
-      channel: 'h5',
-      tenant: { id: db.tenant.id, code: db.tenant.code, name: db.tenant.name },
-      table: { id: table.id, name: table.name, area: table.area, sceneCode: table.sceneCode },
-      customer: { id: customer.id, nickname: customer.nickname, phone: customer.phone }
-    });
-  });
+  }
 
-  route('GET', '/api/client/bootstrap', function (ctx) {
-    var db = ctx.db;
-    resolveCustomer(db, ctx.req);
-    var scene = String(ctx.query.scene || '');
-    var table = db.tables.find(function (t) { return t.sceneCode === scene; });
-    if (!table) throw httpError(404, '桌码无效，请重新扫描桌面上的点单二维码');
-    return ok({
-      tenant: db.tenant,
-      brand: db.brand,
-      store: db.store,
-      table: { id: table.id, name: table.name, area: table.area, seats: table.seats, sceneCode: table.sceneCode },
-      wechat: { appId: db.pay.miniprogram.appId || '', mock: true },
-      serverTime: nowIso()
-    });
-  });
+  function h5BindTenant(db, tenantCode, scene, strictScene) {
+    var table = null;
+    var tenant = null;
+    if (scene) {
+      table = db.tables.find(function (t) { return t.sceneCode === scene; }) || null;
+      if (table) tenant = db.tenant;
+      if (strictScene && !table) throw httpError(400, '桌码已失效，请重新扫描桌面二维码或联系店员');
+    }
+    if (!tenant) {
+      var code = tenantCode || H5_DEFAULT_TENANT_CODE;
+      if (!code) throw httpError(400, '缺少商户编码');
+      if (code !== db.tenant.code) throw httpError(404, '门店不存在，请重新扫码');
+      tenant = db.tenant;
+    }
+    if (tenant.status !== 'ACTIVE') throw httpError(400, '门店暂停营业，请联系商家');
+    return { tenant: tenant, table: table };
+  }
 
-  route('GET', '/api/client/menu', function (ctx) {
-    var db = ctx.db;
-    resolveCustomer(db, ctx.req);
-    var cats = db.categories.filter(function (c) { return c.status === 'ON'; })
-      .sort(function (a, b) { return a.sort - b.sort; });
-    return ok(cats.map(function (c) {
+  function h5TableView(table) {
+    return table ? { id: table.id, name: table.name, area: table.area, seats: table.seats, sceneCode: table.sceneCode } : null;
+  }
+
+  function h5Paginate(query) {
+    var page = parseInt(query.page, 10);
+    var pageSize = parseInt(query.pageSize, 10);
+    if (!isFinite(page) || page < 1) page = 1;
+    if (!isFinite(pageSize) || pageSize < 1) pageSize = 10;
+    if (pageSize > 100) pageSize = 100;
+    return { page: page, pageSize: pageSize, skip: (page - 1) * pageSize, take: pageSize };
+  }
+
+  function h5PickupNo(db) {
+    var start = dayStart(new Date());
+    var count = 0;
+    db.orders.forEach(function (o) {
+      var t = o.createdAt ? new Date(o.createdAt).getTime() : 0;
+      if (o.tenantId === db.tenant.id && t >= start) count += 1;
+    });
+    return count + 1;
+  }
+
+  function h5FinishRefund(db, order, amount, reason, operatorName) {
+    var now = nowIso();
+    if (!order.refunds) order.refunds = [];
+    order.refunds.push({
+      id: uid('rf'),
+      refundNo: 'RF' + String(Date.now()) + pad(Math.floor(Math.random() * 90) + 10),
+      tenantId: db.tenant.id,
+      orderId: order.id,
+      amount: amount,
+      status: 'SUCCESS',
+      reason: reason,
+      operatorName: operatorName,
+      finishedAt: now,
+      createdAt: now
+    });
+    order.payStatus = 'REFUNDED';
+    order.status = 'CANCELLED';
+    order.cancelAt = now;
+    order.cancelReason = reason;
+    order.updatedAt = now;
+    return order;
+  }
+
+  function h5Menu(db, tenantId) {
+    var cats = db.categories.filter(function (c) { return c.tenantId === tenantId && c.status === 'ON'; });
+    cats.sort(function (a, b) {
+      return (a.sort || 0) - (b.sort || 0) || new Date(a.createdAt || 0) - new Date(b.createdAt || 0);
+    });
+    return cats.map(function (c) {
+      var products = db.products.filter(function (p) { return p.categoryId === c.id && p.tenantId === tenantId && p.status === 'ON'; });
+      products.sort(function (a, b) {
+        return (a.sort || 0) - (b.sort || 0) || new Date(a.createdAt || 0) - new Date(b.createdAt || 0);
+      });
       return {
-        id: c.id, name: c.name, icon: c.icon, promoLabel: c.promoLabel, promoTitle: c.promoTitle,
-        products: db.products.filter(function (p) { return p.categoryId === c.id && p.status === 'ON'; })
-          .sort(function (a, b) { return a.sort - b.sort; })
-          .map(function (p) {
-            return {
-              id: p.id, name: p.name, description: p.description, imageUrl: p.imageUrl, price: p.price,
-              originalPrice: p.originalPrice, unit: p.unit,
-              tags: p.tags ? String(p.tags).split(',').filter(Boolean) : [],
-              monthlySales: p.monthlySales, soldOut: p.soldOut,
-              stock: p.stockEnabled ? p.stock : null,
-              specGroups: p.specGroups || []
-            };
-          })
+        id: c.id,
+        name: c.name,
+        icon: c.icon || '',
+        promoLabel: c.promoLabel || '',
+        promoTitle: c.promoTitle || '',
+        products: products.map(function (p) {
+          var groups = (p.specGroups || []).slice();
+          groups.sort(function (a, b) { return (a.sort || 0) - (b.sort || 0); });
+          return {
+            id: p.id,
+            name: p.name,
+            description: p.description,
+            imageUrl: p.imageUrl,
+            price: p.price,
+            originalPrice: p.originalPrice,
+            unit: p.unit,
+            tags: (p.tags || '').split(',').filter(Boolean),
+            monthlySales: p.monthlySales,
+            soldOut: !!(p.soldOut || (p.stockEnabled && p.stock <= 0)),
+            stock: p.stockEnabled ? p.stock : null,
+            specGroups: groups.map(function (group) {
+              var options = (group.options || []).slice();
+              options.sort(function (a, b) { return (a.sort || 0) - (b.sort || 0); });
+              return {
+                id: group.id,
+                name: group.name,
+                required: !!group.required,
+                multiple: !!group.multiple,
+                options: options.map(function (option) {
+                  return { id: option.id, name: option.name, priceDelta: option.priceDelta || 0, defaultSelected: !!option.defaultSelected };
+                })
+              };
+            })
+          };
+        })
       };
-    }));
-  });
+    }).filter(function (category) { return category.products.length > 0; });
+  }
 
-  route('GET', '/api/client/orders', function (ctx) {
-    var db = ctx.db;
-    var customer = resolveCustomer(db, ctx.req);
-    var q = ctx.query || {};
-    var page = Number(q.page || 1), pageSize = Number(q.pageSize || 50);
-    var list = db.orders.filter(function (o) { return o.customerId === customer.id; })
-      .sort(function (a, b) { return new Date(b.createdAt) - new Date(a.createdAt); });
-    return ok({
-      list: list.slice((page - 1) * pageSize, page * pageSize).map(serializeOrder),
-      total: list.length, page: page, pageSize: pageSize
-    });
-  });
-
-  route('GET', '/api/client/orders/:id', function (ctx) {
-    var db = ctx.db;
-    var customer = resolveCustomer(db, ctx.req);
-    var order = db.orders.find(function (o) { return o.id === ctx.params.id; });
-    if (!order) throw httpError(404, '订单不存在');
-    if (order.customerId !== customer.id) throw httpError(403, '无权查看该订单');
-    return ok(serializeOrder(order));
-  });
-
-  route('POST', '/api/client/orders', function (ctx) {
-    var db = ctx.db;
-    var customer = resolveCustomer(db, ctx.req);
-    var b = ctx.body || {};
-    if (!db.store.openStatus) throw httpError(400, '门店已打烊，暂停接单');
-    var table = db.tables.find(function (t) { return t.id === b.tableId; }) || db.tables.find(function (t) { return t.sceneCode === b.scene; });
-    if (!table) throw httpError(400, '桌位不存在，请重新扫码');
+  function h5CreateOrder(db, customer, b) {
     if (b.idempotencyKey) {
       var existed = db.orders.find(function (o) { return o.idempotencyKey === b.idempotencyKey && o.customerId === customer.id; });
-      if (existed) return ok(serializeOrder(existed));
+      if (existed) return existed;
     }
+    if (!db.store.openStatus) throw httpError(400, '门店休息中，暂不接单');
+
+    var type = b.type || ((b.tableId || b.sceneCode) ? 'DINE_IN' : 'TAKEAWAY');
+    var table = null;
+    if (b.tableId) {
+      table = db.tables.find(function (t) { return t.id === b.tableId && t.tenantId === db.tenant.id; }) || null;
+      if (!table) throw httpError(404, '桌位不存在，请重新扫码');
+    } else if (b.sceneCode) {
+      table = db.tables.find(function (t) { return t.sceneCode === b.sceneCode; }) || null;
+      if (!table) throw httpError(404, '桌码无效，请联系店员');
+    }
+
     var priced = priceItems(db, b.items || []);
-    var totals = computeTotals(db, priced.itemAmount, b.type || 'DINE_IN');
+    var totals = computeTotals(db, priced.itemAmount, type);
+
+    if (type === 'TAKEAWAY' && db.store.minOrderAmount > 0 && totals.totalAmount < db.store.minOrderAmount) {
+      throw httpError(400, '自取订单需满 ' + (db.store.minOrderAmount / 100).toFixed(2) + ' 元');
+    }
+
+    var receiver = null;
+    if (type === 'DELIVERY') {
+      var receiverName = String(b.receiverName || '').trim();
+      var receiverPhone = String(b.receiverPhone || '').trim();
+      var address = String(b.address || '').trim();
+      if (!receiverName) throw httpError(400, '请填写收货人姓名');
+      if (!/^1[3-9]\d{9}$/.test(receiverPhone)) throw httpError(400, '请填写正确的手机号');
+      if (address.length < 5) throw httpError(400, '请填写详细收货地址（不少于 5 个字）');
+      if (db.store.deliveryMinAmount > 0 && priced.itemAmount < db.store.deliveryMinAmount) {
+        throw httpError(400, '外卖订单需满 ' + (db.store.deliveryMinAmount / 100).toFixed(2) + ' 元起送');
+      }
+      if (table) throw httpError(400, '外卖订单无需桌号，请重新选择用餐方式');
+      receiver = { name: receiverName, phone: receiverPhone, address: address };
+    }
+
+    var now = nowIso();
     var orderId = uid('ord');
     var order = {
       id: orderId,
       orderNo: buildOrderNo(db),
-      tenantId: db.tenant.id, storeId: db.store.id,
-      tableId: table.id, tableName: table.name,
-      type: b.type || 'DINE_IN', status: 'UNPAID', payStatus: 'UNPAID',
-      customerId: customer.id, customerName: customer.nickname || customer.phone,
-      peopleCount: b.peopleCount || null, remark: b.remark || null,
-      receiverName: b.receiverName || null, receiverPhone: b.receiverPhone || null, address: b.address || null,
-      deliveryFee: totals.deliveryFee, deliveryEta: (b.type === 'DELIVERY') ? (db.store.deliveryEta || null) : null,
-      itemAmount: priced.itemAmount, discountAmount: totals.discountAmount, packingFee: totals.packingFee,
-      totalAmount: totals.totalAmount, paidAmount: 0, pickupNo: null, transactionId: null, outTradeNo: null,
-      idempotencyKey: b.idempotencyKey || null, payChannel: null,
-      acceptAt: null, readyAt: null, completeAt: null, cancelAt: null, cancelReason: null, paidAt: null,
-      createdAt: nowIso(), updatedAt: nowIso(),
-      items: priced.items.map(function (it) { it.orderId = orderId; return it; }),
+      tenantId: db.tenant.id,
+      storeId: db.store.id,
+      tableId: table ? table.id : null,
+      tableName: table ? table.name : null,
+      type: type,
+      status: 'UNPAID',
+      payStatus: 'UNPAID',
+      customerId: customer.id,
+      customerName: customer.nickname || customer.phone || (receiver ? receiver.name : null),
+      peopleCount: b.peopleCount === undefined ? null : b.peopleCount,
+      remark: b.remark || null,
+      receiverName: receiver ? receiver.name : null,
+      receiverPhone: receiver ? receiver.phone : null,
+      address: receiver ? receiver.address : null,
+      deliveryEta: type === 'DELIVERY' ? (db.store.deliveryEta || null) : null,
+      itemAmount: priced.itemAmount,
+      discountAmount: totals.discountAmount,
+      packingFee: totals.packingFee,
+      deliveryFee: totals.deliveryFee,
+      totalAmount: totals.totalAmount,
+      paidAmount: 0,
+      pickupNo: null,
+      transactionId: null,
+      outTradeNo: null,
+      idempotencyKey: b.idempotencyKey || null,
+      payChannel: null,
+      acceptAt: null,
+      readyAt: null,
+      completeAt: null,
+      cancelAt: null,
+      cancelReason: null,
+      paidAt: null,
+      createdAt: now,
+      updatedAt: now,
+      items: priced.items.map(function (it) { it.orderId = orderId; it.tenantId = db.tenant.id; return it; }),
       refunds: []
     };
     db.orders.unshift(order);
+
     (b.items || []).forEach(function (line) {
       var product = db.products.find(function (p) { return p.id === line.productId; });
       if (!product) return;
@@ -1374,23 +1476,191 @@
       if (product.stockEnabled) product.stock = Math.max(0, product.stock - line.quantity);
     });
     save(db);
+    return order;
+  }
+
+  route('POST', '/api/h5/login', function (ctx) {
+    var db = ctx.db;
+    var b = ctx.body || {};
+    var clientId = String(b.clientId || '').trim();
+    if (!clientId || clientId.length < 8) throw httpError(400, '设备标识无效，请刷新页面重试');
+    var scene = String(b.scene || '');
+    var bound = h5BindTenant(db, b.tenantCode, scene, true);
+    var tenant = bound.tenant;
+    var table = bound.table;
+    var openid = ('h5_' + clientId).slice(0, 64);
+    var customer = db.customers.find(function (c) { return c.openid === openid; });
+    if (!customer) {
+      customer = { id: uid('cust'), openid: openid, nickname: '网页顾客', phone: null, avatarUrl: null, lastLoginAt: nowIso() };
+      db.customers.push(customer);
+    } else {
+      customer.lastLoginAt = nowIso();
+    }
+    save(db);
+    return ok({
+      token: 'mock-h5:' + customer.id,
+      channel: 'h5',
+      tenant: { id: tenant.id, code: tenant.code, name: tenant.name },
+      table: h5TableNonNull(table),
+      customer: { id: customer.id, nickname: customer.nickname, phone: customer.phone }
+    });
+  });
+
+  route('GET', '/api/h5/capability', function (ctx) {
+    var db = ctx.db;
+    var tenantCode = String(ctx.query.tenantCode || H5_DEFAULT_TENANT_CODE || '');
+    return ok({
+      tenantCode: tenantCode || db.tenant.code,
+      mockPay: true,
+      payChannel: 'MOCK',
+      tip: '当前为演示支付：下单后直接标记已支付，不产生真实资金流'
+    });
+  });
+
+  function h5TableNonNull(table) {
+    return table ? { id: table.id, name: table.name, area: table.area, sceneCode: table.sceneCode } : null;
+  }
+
+  function h5Bootstrap(db, tenantCode, scene) {
+    var bound = h5BindTenant(db, tenantCode, scene, false);
+    var brand = db.brand || {};
+    var store = db.store || {};
+    return {
+      tenant: { id: bound.tenant.id, code: bound.tenant.code, name: bound.tenant.name },
+      brand: {
+        logoUrl: brand.logoUrl || '',
+        coverUrl: brand.coverUrl || '',
+        primaryColor: brand.primaryColor || '#FF5A1F',
+        accentColor: brand.accentColor || '#F2B544',
+        slogan: brand.slogan || '',
+        announcement: brand.announcement || '',
+        servicePhone: brand.servicePhone || '',
+        copyright: brand.copyright || '',
+        banners: h5ParseBanners(brand.banners)
+      },
+      store: {
+        id: store.id,
+        name: store.name,
+        address: store.address || '',
+        phone: store.phone || '',
+        businessHours: store.businessHours,
+        openStatus: store.openStatus,
+        packingFee: store.packingFee,
+        minOrderAmount: store.minOrderAmount,
+        deliveryFee: store.deliveryFee,
+        deliveryMinAmount: store.deliveryMinAmount,
+        deliveryRange: store.deliveryRange || '',
+        deliveryEta: store.deliveryEta,
+        fullReduceThreshold: store.fullReduceThreshold,
+        fullReduceAmount: store.fullReduceAmount,
+        notice: store.notice || ''
+      },
+      table: bound.table ? { id: bound.table.id, name: bound.table.name, area: bound.table.area, seats: bound.table.seats, sceneCode: bound.table.sceneCode } : null,
+      wechat: { appId: (db.pay && db.pay.miniprogram && db.pay.miniprogram.appId) || '', mock: true },
+      serverTime: Date.now()
+    };
+  }
+
+  route('GET', '/api/client/bootstrap', function (ctx) {
+    var db = ctx.db;
+    return ok(h5Bootstrap(db, ctx.query.tenantCode, String(ctx.query.scene || '')));
+  });
+
+  route('GET', '/api/client/table/:sceneCode', function (ctx) {
+    var db = ctx.db;
+    return ok(h5Bootstrap(db, undefined, ctx.params.sceneCode));
+  });
+
+  route('GET', '/api/client/menu', function (ctx) {
+    var db = ctx.db;
+    var bound = h5BindTenant(db, ctx.query.tenantCode, String(ctx.query.scene || ''), false);
+    return ok(h5Menu(db, bound.tenant.id));
+  });
+
+  route('GET', '/api/client/orders', function (ctx) {
+    var db = ctx.db;
+    var customer = resolveCustomer(db, ctx.req);
+    var q = ctx.query || {};
+    var pg = h5Paginate(q);
+    var status = q.status;
+    var list = db.orders.filter(function (o) {
+      if (o.tenantId !== db.tenant.id || o.customerId !== customer.id) return false;
+      if (status && status !== 'ALL' && o.status !== status) return false;
+      return true;
+    });
+    list.sort(function (a, b) { return new Date(b.createdAt) - new Date(a.createdAt); });
+    return ok({
+      list: list.slice(pg.skip, pg.skip + pg.take).map(serializeOrder),
+      total: list.length,
+      page: pg.page,
+      pageSize: pg.pageSize
+    });
+  });
+
+  route('GET', '/api/client/orders/active', function (ctx) {
+    var db = ctx.db;
+    var customer = resolveCustomer(db, ctx.req);
+    var activeStatuses = ['PENDING', 'PREPARING', 'READY', 'UNPAID'];
+    var list = db.orders.filter(function (o) {
+      return o.tenantId === db.tenant.id && o.customerId === customer.id && activeStatuses.indexOf(o.status) >= 0;
+    });
+    list.sort(function (a, b) { return new Date(b.createdAt) - new Date(a.createdAt); });
+    return ok(list.length ? serializeOrder(list[0]) : null);
+  });
+
+  route('GET', '/api/client/orders/:id', function (ctx) {
+    var db = ctx.db;
+    var customer = resolveCustomer(db, ctx.req);
+    var order = db.orders.find(function (o) { return o.id === ctx.params.id && o.tenantId === db.tenant.id; });
+    if (!order) throw httpError(404, '订单不存在');
+    if (order.customerId && order.customerId !== customer.id) throw httpError(400, '无权查看该订单');
     return ok(serializeOrder(order));
+  });
+
+  route('POST', '/api/client/orders', function (ctx) {
+    var db = ctx.db;
+    var customer = resolveCustomer(db, ctx.req);
+    var order = h5CreateOrder(db, customer, ctx.body || {});
+    return ok(serializeOrder(order));
+  });
+
+  route('POST', '/api/client/orders/:id/items', function (ctx) {
+    var db = ctx.db;
+    var customer = resolveCustomer(db, ctx.req);
+    var b = ctx.body || {};
+    var parent = db.orders.find(function (o) { return o.id === ctx.params.id && o.tenantId === db.tenant.id; });
+    if (!parent) throw httpError(404, '订单不存在');
+    if (parent.customerId && parent.customerId !== customer.id) throw httpError(400, '无权操作该订单');
+    if (!canAppendItems(parent.status)) throw httpError(400, '当前订单状态不支持加菜');
+    var child = h5CreateOrder(db, customer, {
+      tableId: parent.type === 'DELIVERY' ? undefined : (parent.tableId || undefined),
+      type: parent.type,
+      peopleCount: parent.peopleCount || undefined,
+      remark: '加菜（原单 ' + parent.orderNo + '）',
+      receiverName: parent.receiverName || undefined,
+      receiverPhone: parent.receiverPhone || undefined,
+      address: parent.address || undefined,
+      items: b.items || [],
+      idempotencyKey: 'append:' + parent.id + ':' + Date.now()
+    });
+    return ok(serializeOrder(child));
   });
 
   route('POST', '/api/client/orders/:id/pay', function (ctx) {
     var db = ctx.db;
     var customer = resolveCustomer(db, ctx.req);
-    var order = db.orders.find(function (o) { return o.id === ctx.params.id; });
+    var order = db.orders.find(function (o) { return o.id === ctx.params.id && o.tenantId === db.tenant.id; });
     if (!order) throw httpError(404, '订单不存在');
-    if (order.customerId !== customer.id) throw httpError(403, '无权操作该订单');
-    if (order.payStatus === 'PAID') throw httpError(400, '订单已支付');
-    if (order.status !== 'UNPAID') throw httpError(400, '订单当前状态为「' + ORDER_STATUS_TEXT[order.status] + '」，无法支付');
+    if (order.customerId && order.customerId !== customer.id) throw httpError(401, '无权支付该订单');
+    if (order.payStatus === 'PAID') throw httpError(400, '订单已支付，请勿重复支付');
+    if (order.status !== 'UNPAID') throw httpError(400, '当前订单状态不可支付');
     var now = nowIso();
     order.payStatus = 'PAID';
     order.payChannel = 'MOCK';
     order.paidAt = now;
     order.paidAmount = order.totalAmount;
-    order.pickupNo = db.seq.pickupNo++;
+    order.pickupNo = order.pickupNo || h5PickupNo(db);
+    order.transactionId = 'MOCK' + String(Date.now());
     order.status = 'PREPARING';
     order.acceptAt = now;
     order.updatedAt = now;
@@ -1401,27 +1671,40 @@
   route('POST', '/api/client/orders/:id/cancel', function (ctx) {
     var db = ctx.db;
     var customer = resolveCustomer(db, ctx.req);
-    var order = db.orders.find(function (o) { return o.id === ctx.params.id; });
-    if (!order) throw httpError(404, '订单不存在');
-    if (order.customerId !== customer.id) throw httpError(403, '无权操作该订单');
-    if (!canCustomerCancel(order.status)) throw httpError(400, '订单当前状态为「' + ORDER_STATUS_TEXT[order.status] + '」，无法取消');
     var b = ctx.body || {};
-    order.status = 'CANCELLED';
-    order.cancelAt = nowIso();
-    order.cancelReason = b.reason || '顾客取消';
-    if (order.payStatus === 'PAID') { order.payStatus = 'REFUNDED'; order.paidAmount = 0; }
-    order.updatedAt = nowIso();
+    var order = db.orders.find(function (o) { return o.id === ctx.params.id && o.tenantId === db.tenant.id; });
+    if (!order) throw httpError(404, '订单不存在');
+    if (order.customerId && order.customerId !== customer.id) throw httpError(400, '无权操作该订单');
+    var reason = b.reason || '顾客取消';
+    if (order.status === 'UNPAID') {
+      var now = nowIso();
+      order.status = 'CANCELLED';
+      order.payStatus = 'CLOSED';
+      order.cancelAt = now;
+      order.cancelReason = reason;
+      order.updatedAt = now;
+      save(db);
+      return ok({ success: true, refunded: false });
+    }
+    if (order.status !== 'PENDING') throw httpError(400, '商家已接单，请联系店员处理');
+    if (order.payStatus !== 'PAID') throw httpError(400, '该订单未支付或已退款');
+    h5FinishRefund(db, order, order.totalAmount, reason, '顾客自助取消');
     save(db);
-    return ok(serializeOrder(order));
+    return ok({ success: true, refunded: true, order: serializeOrder(order) });
   });
 
   route('POST', '/api/client/orders/:id/remind', function (ctx) {
     var db = ctx.db;
-    var customer = resolveCustomer(db, ctx.req);
-    var order = db.orders.find(function (o) { return o.id === ctx.params.id; });
+    resolveCustomer(db, ctx.req);
+    var order = db.orders.find(function (o) { return o.id === ctx.params.id && o.tenantId === db.tenant.id; });
     if (!order) throw httpError(404, '订单不存在');
-    if (order.customerId !== customer.id) throw httpError(403, '无权操作该订单');
-    return ok({ ok: true, message: '已提醒商家尽快出餐' });
+    if (order.status !== 'PENDING' && order.status !== 'PREPARING') throw httpError(400, '当前订单无需催单');
+    if (!db.remindLocks) db.remindLocks = {};
+    var last = db.remindLocks[order.id] ? new Date(db.remindLocks[order.id]).getTime() : 0;
+    if (last && Date.now() - last < 60 * 1000) throw httpError(400, '已提醒过商家，请耐心等待');
+    db.remindLocks[order.id] = nowIso();
+    save(db);
+    return ok({ success: true });
   });
 
   /* ------------------------------ fetch 接管 ------------------------------ */
